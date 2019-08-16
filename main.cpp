@@ -25,9 +25,9 @@ void print_packet(const u_char *packet, int len);
 
 int arp_request(pcap_t *fp, bool is_sender, ip_set set);
 int arp_reply(pcap_t *fp, struct my_arp_hdr *a_hdr, bool is_sender, ip_set set);
-int send_arp(pcap_t *fp, const struct my_arp_hdr *a_hdr, ip_set set);
+int send_arp(pcap_t *fp, const struct my_arp_hdr *a_hdr, ip_set set, bool is_sender);
 
-int recv_icmp(pcap_t *fp, const struct libnet_ipv4_hdr* ip_hdr, u_char *buf);
+int recv_icmp(pcap_t *fp, struct libnet_ethernet_hdr *ether_hdr, struct libnet_ipv4_hdr *ip_hdr, u_char *buf);
 int send_icmp(pcap_t *fp, ip_set set, u_char *buf, int len);
 
 void *thr_send_arp(void *arg);
@@ -111,7 +111,7 @@ int main(int argc, char* argv[]) {
             continue;
         }
 
-        struct thr_arg_arp t_arg_arp = { fp, &arp_hdr_s, ip_sets[i] };
+        struct thr_arg_arp t_arg_arp = { fp, &arp_hdr_s, &arp_hdr_t, ip_sets[i] };
         tid = pthread_create(&arp_thr[i], nullptr, thr_send_arp, reinterpret_cast<void *>(&t_arg_arp));
         if(tid) {
             fprintf(stderr, "pthread_create error.\n");
@@ -282,7 +282,7 @@ int arp_reply(pcap_t *fp, struct my_arp_hdr *a_hdr, bool is_sender, ip_set set) 
     return 0;
 }
 
-int send_arp(pcap_t *fp, const struct my_arp_hdr *a_hdr, ip_set set) {
+int send_arp(pcap_t *fp, const struct my_arp_hdr *a_hdr, ip_set set, bool is_sender) {
     struct libnet_ethernet_hdr *ether_hdr = reinterpret_cast<libnet_ethernet_hdr *>(malloc(sizeof(libnet_ethernet_hdr)));
     struct my_arp_hdr *arp_hdr = reinterpret_cast<my_arp_hdr *>(malloc(sizeof(my_arp_hdr)));
     struct in_addr addr1, addr2;
@@ -301,11 +301,19 @@ int send_arp(pcap_t *fp, const struct my_arp_hdr *a_hdr, ip_set set) {
     arp_hdr->ar_pro = htons(ETHERTYPE_IP);                   /* format of protocol address */
     arp_hdr->ar_hln = MAC_LEN;                               /* length of hardware address */
     arp_hdr->ar_pln = IP_LEN;                                /* length of protocol addres */
+
+    if(is_sender) {
+        inet_pton(AF_INET, set.target_ip, &addr1);
+        inet_pton(AF_INET, set.sender_ip, &addr2);
+    }
+    else {
+        inet_pton(AF_INET, set.sender_ip, &addr1);
+        inet_pton(AF_INET, set.target_ip, &addr2);
+    }
+
     memcpy(arp_hdr->ar_sha, my_info->my_mac, MAC_LEN);
-    inet_pton(AF_INET, set.target_ip, &addr1);
     memcpy(arp_hdr->ar_spa, &addr1, IP_LEN);
     memcpy(arp_hdr->ar_tha, a_hdr->ar_sha, MAC_LEN);
-    inet_pton(AF_INET, set.sender_ip, &addr2);
     memcpy(arp_hdr->ar_tpa, &addr2, IP_LEN);
     arp_hdr->ar_op = htons(ARPOP_REPLY);
 
@@ -324,8 +332,7 @@ int send_arp(pcap_t *fp, const struct my_arp_hdr *a_hdr, ip_set set) {
     return 0;
 }
 
-int recv_icmp(pcap_t *fp, struct libnet_ipv4_hdr *ip_hdr, u_char *buf) {
-    const struct libnet_ethernet_hdr *ether_hdr;
+int recv_icmp(pcap_t *fp, struct libnet_ethernet_hdr *ether_hdr, struct libnet_ipv4_hdr *ip_hdr, u_char *buf) {
     struct pcap_pkthdr *pkthdr;
     const u_char *packet;
     int res = 0;
@@ -338,7 +345,7 @@ int recv_icmp(pcap_t *fp, struct libnet_ipv4_hdr *ip_hdr, u_char *buf) {
             }
         }
 
-        ether_hdr = reinterpret_cast<const libnet_ethernet_hdr*>(packet);
+        memcpy(ether_hdr, packet, sizeof(struct libnet_ethernet_hdr));
         if(ntohs(ether_hdr->ether_type) != ETHERTYPE_IP) {
             continue;
         }
@@ -385,8 +392,13 @@ void *thr_send_arp(void *arg) {
     struct thr_arg_arp *t_arg = reinterpret_cast<struct thr_arg_arp *>(arg);
 
     while(true) {
-        if(send_arp(t_arg->fp, t_arg->arp_hdr, t_arg->sets)) {
-            fprintf(stderr, "send_arp fail...\n");
+        if(send_arp(t_arg->fp, t_arg->arp_hdr_s, t_arg->sets, true)) {
+            fprintf(stderr, "send_arp (1) fail...\n");
+            break;
+        }
+
+        if(send_arp(t_arg->fp, t_arg->arp_hdr_t, t_arg->sets, false)) {
+            fprintf(stderr, "send_arp (2) fail...\n");
             break;
         }
 
@@ -398,6 +410,8 @@ void *thr_send_arp(void *arg) {
 
 void *thr_recv_send_icmp(void *arg) {
     struct thr_arg_icmp *t_arg = reinterpret_cast<struct thr_arg_icmp *>(arg);
+    struct my_arp_hdr *arp_hdr;
+    struct libnet_ethernet_hdr ether_hdr;
     struct libnet_ipv4_hdr ip_hdr;
     int len;
     u_char buf[BUFSIZE];
@@ -405,17 +419,23 @@ void *thr_recv_send_icmp(void *arg) {
     while(true) {
         memset(buf, 0, BUFSIZE);
 
-        if(recv_icmp(t_arg->fp, &ip_hdr, buf)) {
+        if(recv_icmp(t_arg->fp, &ether_hdr, &ip_hdr, buf)) {
             fprintf(stderr, "recv_icmp fail...\n");
             break;
         }
 
-        if(memcmp(t_arg->arp_hdr_s->ar_spa, &ip_hdr.ip_src, sizeof(struct in_addr))) {
+        if(!memcmp(t_arg->arp_hdr_s->ar_spa, &ip_hdr.ip_src, sizeof(struct in_addr)) && !memcmp(t_arg->arp_hdr_s->ar_sha, ether_hdr.ether_shost, sizeof(uint8_t)*MAC_LEN)) {
+            arp_hdr = t_arg->arp_hdr_t;
+        }
+        else if(!memcmp(t_arg->arp_hdr_t->ar_spa, &ip_hdr.ip_src, sizeof(struct in_addr)) && !memcmp(t_arg->arp_hdr_t->ar_sha, ether_hdr.ether_shost, sizeof(uint8_t)*MAC_LEN)) {
+            arp_hdr = t_arg->arp_hdr_s;
+        }
+        else {
             continue;
         }
 
         len = sizeof(struct libnet_ethernet_hdr) + ntohs(ip_hdr.ip_len);
-        if(send_icmp(t_arg->fp, t_arg->arp_hdr_t, buf, len)) {
+        if(send_icmp(t_arg->fp, arp_hdr, buf, len)) {
             fprintf(stderr, "send_icmp fail...\n");
             break;
         }

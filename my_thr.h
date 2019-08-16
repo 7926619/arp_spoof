@@ -12,7 +12,8 @@ typedef struct _ip_set {
 struct thr_arg_arp
 {
     pcap_t *fp;
-    struct my_arp_hdr *arp_hdr;
+    struct my_arp_hdr *arp_hdr_s;
+    struct my_arp_hdr *arp_hdr_t;
     ip_set sets;
 };
 
